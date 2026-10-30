@@ -127,7 +127,7 @@ jobs:
             uname -a
             printf 'core_limit='; ulimit -c
             printf 'core_pattern='; cat /proc/sys/kernel/core_pattern
-          } | tee "$NPU_CI_DIAGNOSTICS/environment.log"
+          } | tee "$NPU_CI_DIAGNOSTICS/environment.log" || echo "::warning::Environment snapshot incomplete"
           # Keep pytest options out of sys.argv: MegatronAdaptor parses it during imports.
           # -c also avoids a <stdin> main module that multiprocessing.spawn cannot reload.
           # Preserve the Python process exit status, including a fault after pytest returns.
@@ -237,18 +237,73 @@ jobs:
         run: |
           PYTHONPATH="$PWD:$PYTHONPATH" torchrun --standalone --nproc-per-node=2 tests/special_distributed/test_fsdp2_model_cpu_offload.py
       - name: Running NPU checkpoint_engine unit tests
+        id: checkpoint_baseline
+        shell: bash
+        env:
+          PYTHONFAULTHANDLER: "1"
+          PYTHONUNBUFFERED: "1"
+          VERL_CHECKPOINT_DIAGNOSTICS_DIR: ${{ runner.temp }}/checkpoint-weights-${{ github.run_id }}-${{ github.run_attempt }}/baseline
+          VERL_CHECKPOINT_WEIGHT_FINGERPRINTS: "0"
         run: |
+          mkdir -p "$VERL_CHECKPOINT_DIAGNOSTICS_DIR"
           # Keep pytest options out of sys.argv: MegatronAdaptor parses it during imports.
           # -c also avoids a <stdin> main module that multiprocessing.spawn cannot reload.
+          # Run both bucket sizes even when the first case fails.
+          set +e
           python -c '
           import pytest
 
           raise SystemExit(pytest.main([
               "-s",
-              "-x",
               "tests/checkpoint_engine/test_correctness_on_npu.py",
           ]))
-          '
+          ' 2>&1 | tee "$VERL_CHECKPOINT_DIAGNOSTICS_DIR/pytest.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          printf 'python_exit_code=%s tee_exit_code=%s\n' "${pipeline_status[0]}" "${pipeline_status[1]}" \
+            > "$VERL_CHECKPOINT_DIAGNOSTICS_DIR/process-exit.log"
+          if [ "${pipeline_status[0]}" -ne 0 ]; then exit "${pipeline_status[0]}"; fi
+          exit "${pipeline_status[1]}"
+      - name: Diagnose NPU checkpoint weights with CPU fingerprints
+        if: ${{ !cancelled() && steps.checkpoint_baseline.outcome == 'failure' }}
+        shell: bash
+        env:
+          PYTHONFAULTHANDLER: "1"
+          PYTHONUNBUFFERED: "1"
+          VERL_CHECKPOINT_WEIGHT_FINGERPRINTS: "1"
+          VERL_CHECKPOINT_DIAGNOSTICS_DIR: ${{ runner.temp }}/checkpoint-weights-${{ github.run_id }}-${{ github.run_attempt }}/fingerprints
+        run: |
+          mkdir -p "$VERL_CHECKPOINT_DIAGNOSTICS_DIR"
+          # This separate control synchronizes/copies tensors; it may hide a timing bug.
+          set +e
+          python -c '
+          import pytest
+
+          raise SystemExit(pytest.main([
+              "-s",
+              "tests/checkpoint_engine/test_correctness_on_npu.py",
+          ]))
+          ' 2>&1 | tee "$VERL_CHECKPOINT_DIAGNOSTICS_DIR/pytest.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          printf 'python_exit_code=%s tee_exit_code=%s\n' "${pipeline_status[0]}" "${pipeline_status[1]}" \
+            > "$VERL_CHECKPOINT_DIAGNOSTICS_DIR/process-exit.log"
+          if [ "${pipeline_status[0]}" -ne 0 ]; then exit "${pipeline_status[0]}"; fi
+          exit "${pipeline_status[1]}"
+      - name: Summarize NPU checkpoint weight diagnostics
+        if: ${{ !cancelled() && (steps.checkpoint_baseline.outcome == 'success' || steps.checkpoint_baseline.outcome == 'failure') }}
+        env:
+          CHECKPOINT_DIAGNOSTICS_ROOT: ${{ runner.temp }}/checkpoint-weights-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python -c 'import os; from tests.checkpoint_engine.weight_diagnostics import summarize; summarize(os.environ["CHECKPOINT_DIAGNOSTICS_ROOT"])'
+      - name: Upload NPU checkpoint weight diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-checkpoint-weights-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/checkpoint-weights-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
+          retention-days: 7
       - name: Running CPU checkpoint_engine unit tests
         run: |
           # Keep pytest options out of sys.argv: MegatronAdaptor parses it during imports.

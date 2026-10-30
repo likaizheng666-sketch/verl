@@ -12,12 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import os
 from typing import Generator
 
 import ray
 import torch
 from transformers import AutoModelForCausalLM
 
+from tests.checkpoint_engine.weight_diagnostics import (
+    diagnose_sender,
+    fingerprint,
+    fingerprints_enabled,
+    mismatch_details,
+    record,
+)
 from verl.checkpoint_engine import CheckpointEngineRegistry, CheckpointEngineWorker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
@@ -38,10 +46,15 @@ class TrainingWorkerTest(TrainingWorker):
         if torch.distributed.get_rank() == 0:
             engine_kwargs["is_master"] = True
         self.checkpoint_engine = CheckpointEngineRegistry.new(backend, bucket_size=bucket_size, **engine_kwargs)
+        self._diagnostic_update_index = 0
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
         per_tensor_param, _ = self.engine.get_per_tensor_param()
+        update_index = self._diagnostic_update_index
+        self._diagnostic_update_index += 1
+        if fingerprints_enabled() and torch.distributed.get_rank() == 0:
+            per_tensor_param = diagnose_sender(per_tensor_param, update_index)
         await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
@@ -55,6 +68,7 @@ class MockServerAdapter(BaseRollout):
         self.check_allclose = check_allclose
         self.model = None
         self.received_weights: dict[str, torch.Tensor] = {}
+        self._diagnostic_update_index = 0
 
     async def resume(self, tags: list[str]):
         raise NotImplementedError()
@@ -83,10 +97,17 @@ class MockServerAdapter(BaseRollout):
         for name, weight in self.model.state_dict().items():
             assert name in self.received_weights, f"weight {name} not received"
             received = self.received_weights[name]
-            assert torch.allclose(weight.to(received.device, dtype=received.dtype), received), (
-                f"weight {name} not equal"
-            )
+            equal = torch.allclose(weight.to(received.device, dtype=received.dtype), received)
+            if fingerprints_enabled():
+                record("received", name, self._diagnostic_update_index, **fingerprint(received))
+                record("reference", name, self._diagnostic_update_index, **fingerprint(weight, dtype=received.dtype))
+            if not equal and os.getenv("VERL_CHECKPOINT_DIAGNOSTICS_DIR"):
+                details = mismatch_details(weight, received)
+                record("mismatch", name, self._diagnostic_update_index, **details)
+                print(f"CHECKPOINT_WEIGHT_DIAGNOSTIC weight={name} {details}", flush=True)
+            assert equal, f"weight {name} not equal"
         self.received_weights.clear()
+        self._diagnostic_update_index += 1
         print("Check passed, all weights are equal!")
 
 
