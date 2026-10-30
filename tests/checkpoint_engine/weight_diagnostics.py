@@ -17,9 +17,7 @@ import hashlib
 import json
 import os
 import socket
-from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
 
 import torch
 
@@ -31,13 +29,10 @@ def diagnostic_env(case):
         for key in (
             "VERL_CHECKPOINT_DIAGNOSTICS_DIR",
             "VERL_CHECKPOINT_WEIGHT_FINGERPRINTS",
-            "VERL_CHECKPOINT_EXPORT_SYNC",
         )
         if key in os.environ
     }
     if settings:
-        if os.getenv("VERL_CHECKPOINT_EXPORT_SYNC") == "1":
-            case += "-export-sync"
         settings["VERL_CHECKPOINT_DIAGNOSTIC_CASE"] = case
     return settings
 
@@ -112,34 +107,6 @@ def record_export_shards(params, update_index, rank):
                 record("unsupported_shard", name, update_index, shard_rank=rank)
                 continue
             record("export_shard", name, update_index, shard_rank=rank, **fingerprint(value.to_local()))
-
-
-@contextmanager
-def synchronize_dtensor_exports():
-    """Test-only control: retain the DTensor until NPU reconstruction has completed.
-
-    full_tensor already establishes stream ordering. This extra device wait is
-    an experiment for backend/lifetime issues, not a claimed production fix.
-    Apply on every trainer, including trainers that only consume the generator.
-    """
-    from torch.distributed.tensor import DTensor
-
-    original = DTensor.full_tensor
-    waits = 0
-
-    def completed(self, *args, **kwargs):
-        nonlocal waits
-        result = original(self, *args, **kwargs)
-        if self.device.type == "npu":
-            torch.npu.synchronize(self.device)
-            waits += 1
-        return result
-
-    with patch.object(DTensor, "full_tensor", completed):
-        try:
-            yield
-        finally:
-            print(f"CHECKPOINT_EXPORT_SYNC completed_tensors={waits}", flush=True)
 
 
 def mismatch_details(expected, received, chunk_bytes=4 << 20):

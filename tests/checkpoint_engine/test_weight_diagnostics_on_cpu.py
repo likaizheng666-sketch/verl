@@ -14,8 +14,6 @@
 import hashlib
 import json
 import sys
-from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -29,7 +27,6 @@ from tests.checkpoint_engine.weight_diagnostics import (
     record_export_shards,
     record_loaded_weights,
     summarize,
-    synchronize_dtensor_exports,
 )
 
 
@@ -177,33 +174,3 @@ def test_source_audit_records_real_dtensor(tmp_path, monkeypatch):
         assert checks[0]["boundary"] == "loaded_to_export_shard" and checks[0]["equal"] is True
     finally:
         dist.destroy_process_group()
-
-
-@pytest.mark.parametrize("device_type", ["cpu", "npu"])
-def test_export_completion_control_waits_before_return_and_restores(tmp_path, monkeypatch, device_type):
-    from torch.distributed.tensor import DTensor
-
-    events = []
-    output = torch.tensor([1.0])
-
-    def materialize(tensor, **kwargs):
-        assert kwargs == {"grad_placements": None}
-        events.append("materialize")
-        return output
-
-    monkeypatch.setattr(DTensor, "full_tensor", materialize)
-    device = SimpleNamespace(type=device_type)
-    sync = Mock(side_effect=lambda actual_device: events.append(("wait", actual_device)))
-    monkeypatch.setattr(torch, "npu", SimpleNamespace(synchronize=sync), raising=False)
-    with pytest.raises(RuntimeError, match="consumer failed"):
-        with synchronize_dtensor_exports():
-            result = DTensor.full_tensor(SimpleNamespace(device=device), grad_placements=None)
-            assert result is output
-            assert events == (["materialize", ("wait", device)] if device_type == "npu" else ["materialize"])
-            raise RuntimeError("consumer failed")
-    assert DTensor.full_tensor is materialize
-
-
-def test_export_control_uses_a_separate_case(monkeypatch):
-    monkeypatch.setenv("VERL_CHECKPOINT_EXPORT_SYNC", "1")
-    assert diagnostic_env("hccl-3072")["VERL_CHECKPOINT_DIAGNOSTIC_CASE"] == "hccl-3072-export-sync"

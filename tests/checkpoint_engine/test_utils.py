@@ -29,7 +29,6 @@ from tests.checkpoint_engine.weight_diagnostics import (
     record,
     record_export_shards,
     record_loaded_weights,
-    synchronize_dtensor_exports,
 )
 from verl.checkpoint_engine import CheckpointEngineRegistry, CheckpointEngineWorker
 from verl.single_controller.base.decorator import Dispatch, register
@@ -87,11 +86,7 @@ class TrainingWorkerTest(TrainingWorker):
             per_tensor_param, _ = self.engine.get_per_tensor_param()
         if fingerprints_enabled() and torch.distributed.get_rank() == 0:
             per_tensor_param = diagnose_sender(per_tensor_param, update_index)
-        sync_control = (
-            synchronize_dtensor_exports() if os.getenv("VERL_CHECKPOINT_EXPORT_SYNC") == "1" else nullcontext()
-        )
-        with sync_control:
-            await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+        await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
