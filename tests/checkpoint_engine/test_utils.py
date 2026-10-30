@@ -13,7 +13,9 @@
 # limitations under the License.
 import asyncio
 import os
+from contextlib import nullcontext
 from typing import Generator
+from unittest.mock import patch
 
 import ray
 import torch
@@ -25,6 +27,9 @@ from tests.checkpoint_engine.weight_diagnostics import (
     fingerprints_enabled,
     mismatch_details,
     record,
+    record_export_shards,
+    record_loaded_weights,
+    synchronize_dtensor_exports,
 )
 from verl.checkpoint_engine import CheckpointEngineRegistry, CheckpointEngineWorker
 from verl.single_controller.base.decorator import Dispatch, register
@@ -48,14 +53,45 @@ class TrainingWorkerTest(TrainingWorker):
         self.checkpoint_engine = CheckpointEngineRegistry.new(backend, bucket_size=bucket_size, **engine_kwargs)
         self._diagnostic_update_index = 0
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset(self):
+        if not fingerprints_enabled():
+            return super().reset()
+        build_fsdp = self.engine._build_fsdp_module
+
+        def observed_build(module):
+            if torch.distributed.get_rank() == 0:
+                record_loaded_weights(module.state_dict().items(), torch.distributed.get_world_size())
+            return build_fsdp(module)
+
+        with patch.object(self.engine, "_build_fsdp_module", observed_build):
+            return super().reset()
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
-        per_tensor_param, _ = self.engine.get_per_tensor_param()
         update_index = self._diagnostic_update_index
         self._diagnostic_update_index += 1
+        state_dict = self.engine.module.state_dict
+
+        def observed_state_dict(*args, **kwargs):
+            params = state_dict(*args, **kwargs)
+            record_export_shards(params, update_index, torch.distributed.get_rank())
+            return params
+
+        observe_shards = (
+            patch.object(self.engine.module, "state_dict", observed_state_dict)
+            if fingerprints_enabled() and update_index == 0
+            else nullcontext()
+        )
+        with observe_shards:
+            per_tensor_param, _ = self.engine.get_per_tensor_param()
         if fingerprints_enabled() and torch.distributed.get_rank() == 0:
             per_tensor_param = diagnose_sender(per_tensor_param, update_index)
-        await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+        sync_control = (
+            synchronize_dtensor_exports() if os.getenv("VERL_CHECKPOINT_EXPORT_SYNC") == "1" else nullcontext()
+        )
+        with sync_control:
+            await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

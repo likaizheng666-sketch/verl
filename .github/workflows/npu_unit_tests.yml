@@ -238,12 +238,14 @@ jobs:
           PYTHONPATH="$PWD:$PYTHONPATH" torchrun --standalone --nproc-per-node=2 tests/special_distributed/test_fsdp2_model_cpu_offload.py
       - name: Running NPU checkpoint_engine unit tests
         id: checkpoint_baseline
+        timeout-minutes: 8
         shell: bash
         env:
           PYTHONFAULTHANDLER: "1"
           PYTHONUNBUFFERED: "1"
           VERL_CHECKPOINT_DIAGNOSTICS_DIR: ${{ runner.temp }}/checkpoint-weights-${{ github.run_id }}-${{ github.run_attempt }}/baseline
           VERL_CHECKPOINT_WEIGHT_FINGERPRINTS: "0"
+          VERL_CHECKPOINT_EXPORT_SYNC: "0"
         run: |
           mkdir -p "$VERL_CHECKPOINT_DIAGNOSTICS_DIR"
           # Keep pytest options out of sys.argv: MegatronAdaptor parses it during imports.
@@ -265,16 +267,48 @@ jobs:
           if [ "${pipeline_status[0]}" -ne 0 ]; then exit "${pipeline_status[0]}"; fi
           exit "${pipeline_status[1]}"
       - name: Diagnose NPU checkpoint weights with CPU fingerprints
+        id: checkpoint_fingerprints
         if: ${{ !cancelled() && steps.checkpoint_baseline.outcome == 'failure' }}
+        timeout-minutes: 12
         shell: bash
         env:
           PYTHONFAULTHANDLER: "1"
           PYTHONUNBUFFERED: "1"
           VERL_CHECKPOINT_WEIGHT_FINGERPRINTS: "1"
+          VERL_CHECKPOINT_EXPORT_SYNC: "0"
           VERL_CHECKPOINT_DIAGNOSTICS_DIR: ${{ runner.temp }}/checkpoint-weights-${{ github.run_id }}-${{ github.run_attempt }}/fingerprints
         run: |
           mkdir -p "$VERL_CHECKPOINT_DIAGNOSTICS_DIR"
           # This separate control synchronizes/copies tensors; it may hide a timing bug.
+          set +e
+          python -c '
+          import pytest
+
+          raise SystemExit(pytest.main([
+              "-s",
+              "tests/checkpoint_engine/test_correctness_on_npu.py",
+          ]))
+          ' 2>&1 | tee "$VERL_CHECKPOINT_DIAGNOSTICS_DIR/pytest.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          printf 'python_exit_code=%s tee_exit_code=%s\n' "${pipeline_status[0]}" "${pipeline_status[1]}" \
+            > "$VERL_CHECKPOINT_DIAGNOSTICS_DIR/process-exit.log"
+          if [ "${pipeline_status[0]}" -ne 0 ]; then exit "${pipeline_status[0]}"; fi
+          exit "${pipeline_status[1]}"
+      - name: Test NPU checkpoint export completion control
+        if: ${{ !cancelled() && steps.checkpoint_baseline.outcome == 'failure' }}
+        timeout-minutes: 8
+        shell: bash
+        env:
+          PYTHONFAULTHANDLER: "1"
+          PYTHONUNBUFFERED: "1"
+          VERL_CHECKPOINT_WEIGHT_FINGERPRINTS: "0"
+          VERL_CHECKPOINT_EXPORT_SYNC: "1"
+          VERL_CHECKPOINT_DIAGNOSTICS_DIR: ${{ runner.temp }}/checkpoint-weights-${{ github.run_id }}-${{ github.run_attempt }}/export-sync
+        run: |
+          mkdir -p "$VERL_CHECKPOINT_DIAGNOSTICS_DIR"
+          # Separate candidate workaround: wait for full_tensor on every trainer.
+          # No CPU hashing in this control; baseline failure remains a job failure.
           set +e
           python -c '
           import pytest

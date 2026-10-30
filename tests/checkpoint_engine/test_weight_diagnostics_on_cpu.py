@@ -13,6 +13,9 @@
 # limitations under the License.
 import hashlib
 import json
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -23,7 +26,10 @@ from tests.checkpoint_engine.weight_diagnostics import (
     fingerprint,
     mismatch_details,
     record,
+    record_export_shards,
+    record_loaded_weights,
     summarize,
+    synchronize_dtensor_exports,
 )
 
 
@@ -112,3 +118,92 @@ def test_incomplete_jsonl_is_reported(tmp_path):
     result = summarize(tmp_path)
     assert result["unreadable"] == 1
     assert result["compared"] == 0
+
+
+@pytest.mark.parametrize("shards", [2, 8])
+def test_loaded_shards_include_uneven_and_empty_slices(tmp_path, monkeypatch, shards):
+    monkeypatch.setenv("VERL_CHECKPOINT_DIAGNOSTICS_DIR", str(tmp_path))
+    weight = torch.arange(15).reshape(5, 3)
+    record_loaded_weights([("weight", weight)], shards)
+    entries = [json.loads(line) for line in next(tmp_path.glob("*.jsonl")).read_text().splitlines()]
+    assert entries[0]["stage"] == "loaded"
+    local = entries[1:]
+    assert len(local) == shards
+    expected = list(weight.chunk(shards, dim=0))
+    expected.extend([weight[:0]] * (shards - len(expected)))
+    for rank, (entry, shard) in enumerate(zip(local, expected, strict=True)):
+        assert entry["shard_rank"] == rank
+        assert entry["sha256"] == fingerprint(shard)["sha256"]
+        assert entry["shape"] == list(shard.shape)
+
+
+def test_source_audit_separates_loading_sharding_and_gathering(tmp_path, monkeypatch):
+    monkeypatch.setenv("VERL_CHECKPOINT_DIAGNOSTICS_DIR", str(tmp_path))
+    original, changed = torch.tensor([1.0]), torch.tensor([2.0])
+    for name, loaded, shard, sender in (
+        ("load", changed, changed, changed),
+        ("shard", original, changed, changed),
+        ("gather", original, original, changed),
+    ):
+        record_loaded_weights([(name, loaded)], 1)
+        record("export_shard", name, 0, shard_rank=0, **fingerprint(shard))
+        for stage, tensor in (("sender", sender), ("received", sender), ("reference", original)):
+            record(stage, name, 0, **fingerprint(tensor))
+    result = summarize(tmp_path)
+    checks = {(item["name"], item["boundary"]): item["equal"] for item in result["source_checks"]}
+    assert checks["load", "loaded_to_sender"] is True
+    assert checks["load", "loaded_to_reference"] is False
+    assert checks["shard", "loaded_to_export_shard"] is False
+    assert checks["gather", "loaded_to_export_shard"] is True
+    assert checks["gather", "loaded_to_sender"] is False
+
+
+def test_source_audit_records_real_dtensor(tmp_path, monkeypatch):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    if not dist.is_gloo_available() or sys.platform == "win32":
+        pytest.skip("The CPU DTensor integration check requires a Linux Gloo transport")
+    monkeypatch.setenv("VERL_CHECKPOINT_DIAGNOSTICS_DIR", str(tmp_path / "records"))
+    dist.init_process_group("gloo", init_method=(tmp_path / "store").as_uri(), rank=0, world_size=1)
+    try:
+        source = torch.arange(6.0).reshape(2, 3)
+        distributed = distribute_tensor(source, init_device_mesh("cpu", (1,)), [Shard(0)])
+        record_loaded_weights([("weight", source)], 1)
+        record_export_shards({"weight": distributed}, 0, rank=0)
+        checks = summarize(tmp_path / "records")["source_checks"]
+        assert len(checks) == 1
+        assert checks[0]["boundary"] == "loaded_to_export_shard" and checks[0]["equal"] is True
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "npu"])
+def test_export_completion_control_waits_before_return_and_restores(tmp_path, monkeypatch, device_type):
+    from torch.distributed.tensor import DTensor
+
+    events = []
+    output = torch.tensor([1.0])
+
+    def materialize(tensor, **kwargs):
+        assert kwargs == {"grad_placements": None}
+        events.append("materialize")
+        return output
+
+    monkeypatch.setattr(DTensor, "full_tensor", materialize)
+    device = SimpleNamespace(type=device_type)
+    sync = Mock(side_effect=lambda actual_device: events.append(("wait", actual_device)))
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(synchronize=sync), raising=False)
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        with synchronize_dtensor_exports():
+            result = DTensor.full_tensor(SimpleNamespace(device=device), grad_placements=None)
+            assert result is output
+            assert events == (["materialize", ("wait", device)] if device_type == "npu" else ["materialize"])
+            raise RuntimeError("consumer failed")
+    assert DTensor.full_tensor is materialize
+
+
+def test_export_control_uses_a_separate_case(monkeypatch):
+    monkeypatch.setenv("VERL_CHECKPOINT_EXPORT_SYNC", "1")
+    assert diagnostic_env("hccl-3072")["VERL_CHECKPOINT_DIAGNOSTIC_CASE"] == "hccl-3072-export-sync"

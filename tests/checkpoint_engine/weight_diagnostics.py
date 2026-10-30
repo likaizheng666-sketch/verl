@@ -17,7 +17,9 @@ import hashlib
 import json
 import os
 import socket
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -26,10 +28,16 @@ def diagnostic_env(case):
     """Explicitly propagate only diagnostic settings to Ray workers."""
     settings = {
         key: os.environ[key]
-        for key in ("VERL_CHECKPOINT_DIAGNOSTICS_DIR", "VERL_CHECKPOINT_WEIGHT_FINGERPRINTS")
+        for key in (
+            "VERL_CHECKPOINT_DIAGNOSTICS_DIR",
+            "VERL_CHECKPOINT_WEIGHT_FINGERPRINTS",
+            "VERL_CHECKPOINT_EXPORT_SYNC",
+        )
         if key in os.environ
     }
     if settings:
+        if os.getenv("VERL_CHECKPOINT_EXPORT_SYNC") == "1":
+            case += "-export-sync"
         settings["VERL_CHECKPOINT_DIAGNOSTIC_CASE"] = case
     return settings
 
@@ -80,6 +88,60 @@ def diagnose_sender(weights, update_index):
         yield name, weight
 
 
+def record_loaded_weights(weights, shard_count):
+    """Record rank-zero HF weights before FSDP and the expected Shard(0) slices."""
+    for name, weight in weights:
+        record("loaded", name, -1, **fingerprint(weight))
+        if weight.ndim == 0:
+            continue
+        # Match DTensor Shard(0), including uneven and empty trailing shards.
+        chunks = weight.chunk(shard_count, dim=0)
+        for rank in range(shard_count):
+            shard = chunks[rank] if rank < len(chunks) else weight[:0]
+            record("loaded_shard", name, -1, shard_rank=rank, **fingerprint(shard))
+
+
+def record_export_shards(params, update_index, rank):
+    """Observe FSDP's real state_dict before the later DTensor full_tensor call."""
+    from torch.distributed.tensor import DTensor, Shard
+
+    for name, value in params.items():
+        if isinstance(value, DTensor):
+            supported = value.device_mesh.ndim == 1 and value.placements == (Shard(0),)
+            if not supported:
+                record("unsupported_shard", name, update_index, shard_rank=rank)
+                continue
+            record("export_shard", name, update_index, shard_rank=rank, **fingerprint(value.to_local()))
+
+
+@contextmanager
+def synchronize_dtensor_exports():
+    """Test-only control: retain the DTensor until NPU reconstruction has completed.
+
+    full_tensor already establishes stream ordering. This extra device wait is
+    an experiment for backend/lifetime issues, not a claimed production fix.
+    Apply on every trainer, including trainers that only consume the generator.
+    """
+    from torch.distributed.tensor import DTensor
+
+    original = DTensor.full_tensor
+    waits = 0
+
+    def completed(self, *args, **kwargs):
+        nonlocal waits
+        result = original(self, *args, **kwargs)
+        if self.device.type == "npu":
+            torch.npu.synchronize(self.device)
+            waits += 1
+        return result
+
+    with patch.object(DTensor, "full_tensor", completed):
+        try:
+            yield
+        finally:
+            print(f"CHECKPOINT_EXPORT_SYNC completed_tensors={waits}", flush=True)
+
+
 def mismatch_details(expected, received, chunk_bytes=4 << 20):
     """Describe an existing failed assertion, using the same default allclose tolerances."""
     result = {
@@ -117,6 +179,8 @@ def summarize(directory):
     """Compare each receiver with the sender and its dtype-normalized HF reference."""
     root = Path(directory)
     senders, references, receivers, failures = {}, {}, [], []
+    loaded, loaded_shards, export_shards = {}, {}, []
+    unsupported_shards = 0
     unreadable = 0
     for path in sorted(root.rglob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -135,6 +199,43 @@ def summarize(directory):
                 receivers.append((key, peer, entry))
             elif entry["stage"] == "mismatch":
                 failures.append({**entry, "record_file": path.relative_to(root).as_posix()})
+            elif entry["stage"] == "loaded":
+                loaded[(entry["case"], entry["name"])] = entry
+            elif entry["stage"] == "loaded_shard":
+                loaded_shards[(entry["case"], entry["name"], entry["shard_rank"])] = entry
+            elif entry["stage"] == "export_shard":
+                export_shards.append(entry)
+            elif entry["stage"] == "unsupported_shard":
+                unsupported_shards += 1
+
+    def signature(item):
+        return item["dtype"], item["shape"], item["sha256"]
+
+    # Report all observed source boundaries, even after receiver assertions stop.
+    source_checks = []
+    for key, sender in senders.items():
+        initial = loaded.get((key[0], key[2]))
+        source_checks.append(
+            {
+                "case": key[0],
+                "update_index": key[1],
+                "name": key[2],
+                "boundary": "loaded_to_sender",
+                "equal": signature(initial) == signature(sender) if initial is not None else None,
+            }
+        )
+    for entry in export_shards:
+        initial = loaded_shards.get((entry["case"], entry["name"], entry["shard_rank"]))
+        source_checks.append(
+            {
+                "case": entry["case"],
+                "update_index": entry["update_index"],
+                "name": entry["name"],
+                "shard_rank": entry["shard_rank"],
+                "boundary": "loaded_to_export_shard",
+                "equal": signature(initial) == signature(entry) if initial is not None else None,
+            }
+        )
 
     differences, compared, incomplete = [], 0, 0
     for key, peer, received in receivers:
@@ -144,11 +245,19 @@ def summarize(directory):
             continue
         compared += 1
 
-        def signature(item):
-            return item["dtype"], item["shape"], item["sha256"]
-
         source_matches = signature(sender) == signature(received)
         reference_matches = signature(reference) == signature(received)
+        initial = loaded.get((key[0], key[2]))
+        source_checks.append(
+            {
+                "case": key[0],
+                "update_index": key[1],
+                "name": key[2],
+                "receiver": list(peer),
+                "boundary": "loaded_to_reference",
+                "equal": signature(initial) == signature(reference) if initial is not None else None,
+            }
+        )
         if not source_matches or not reference_matches:
             differences.append(
                 {
@@ -166,6 +275,13 @@ def summarize(directory):
         "unreadable": unreadable,
         "differences": differences,
         "assertion_failures": failures,
+        "source_checks": source_checks,
+        "unsupported_shards": unsupported_shards,
+        "source_record_counts": {
+            "loaded": len(loaded),
+            "loaded_shards": len(loaded_shards),
+            "export_shards": len(export_shards),
+        },
     }
     root.mkdir(parents=True, exist_ok=True)
     (root / "comparison.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
@@ -175,6 +291,10 @@ def summarize(directory):
         "unreadable": unreadable,
         "differences": len(differences),
         "assertion_failures": len(failures),
+        "source_differences": sum(entry["equal"] is False for entry in source_checks),
+        "source_incomplete": sum(entry["equal"] is None for entry in source_checks),
+        "export_shards": len(export_shards),
+        "unsupported_shards": unsupported_shards,
     }
     print(f"CHECKPOINT_WEIGHT_DIAGNOSTIC {json.dumps(brief)}", flush=True)
     return result
